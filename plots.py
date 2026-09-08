@@ -380,7 +380,7 @@ def create_cep_heatmap(ballistic_data, guided_data):
     ballistic_impact_x = ballistic_data['x'][-1]
     ballistic_impact_y = ballistic_data['y'][-1]
     ax1.plot(ballistic_impact_x, ballistic_impact_y, 'bs', markersize=15,
-             label=f"Miss: {ballistic_data.get('miss_distance', 0):.1f}m")
+             label=f"Ballistic Impact")
     ax1.arrow(target_x, target_y, ballistic_impact_x - target_x,
               ballistic_impact_y - target_y, head_width=5, head_length=5,
               fc='blue', ec='blue', alpha=0.5)
@@ -406,7 +406,7 @@ def create_cep_heatmap(ballistic_data, guided_data):
     guided_impact_x = guided_data['x'][-1]
     guided_impact_y = guided_data['y'][-1]
     ax2.plot(guided_impact_x, guided_impact_y, 'r^', markersize=15,
-             label=f"Miss: {guided_data.get('miss_distance', 0):.1f}m")
+             label=f"Guided Impact")
     ax2.arrow(target_x, target_y, guided_impact_x - target_x,
               guided_impact_y - target_y, head_width=5, head_length=5,
               fc='red', ec='red', alpha=0.5)
@@ -483,3 +483,210 @@ def display_summary_statistics(baseline_data, controlled_data):
     print(f"  Controlled mean pitch:       {controlled_pitch_mean:.2f} degrees")
 
     print("\n" + "=" * 70)
+
+def create_pid_telemetry_dashboard(guided_data):
+    """
+    Creates a minimalist, high-density telemetry dashboard showing
+    the internal micro-corrections of the PD control loops.
+    """
+    import matplotlib.pyplot as plt
+    import numpy as np
+    import math
+
+    time = guided_data['time']
+    alt_error = guided_data['altitude_error']
+    pitch_actual = [math.degrees(p) for p in guided_data['pitch']]
+    pitch_cmd = guided_data['pitch_command']
+    pitch_rate = [math.degrees(pr) for pr in guided_data['pitch_rate']]
+    surface_cmd = [math.degrees(s) for s in guided_data['surface_commanded']]
+
+    fig, axs = plt.subplots(4, 1, figsize=(12, 14), sharex=True)
+    fig.subplots_adjust(hspace=0.3)
+    fig.suptitle('Guided Projectile Telemetry & PD Controller Micro-Corrections',
+                 fontsize=16, fontweight='bold')
+
+    # Global styling for a clean, professional aesthetic
+    for ax in axs:
+        ax.grid(True, linestyle='--', alpha=0.4, color='gray')
+        ax.set_facecolor('#ffffff')
+        # Crisp black outlines
+        for spine in ax.spines.values():
+            spine.set_edgecolor('black')
+            spine.set_linewidth(1.5)
+        ax.tick_params(colors='black', width=1.5)
+
+    # 1. Altitude Error (Outer Guidance Loop)
+    axs[0].plot(time, alt_error, color='black', linewidth=2)
+    axs[0].axhline(0, color='gray', linestyle='-', linewidth=1)
+    axs[0].set_ylabel('Alt Error (m)', fontweight='bold')
+    axs[0].set_title('Trajectory Deviation (Outer Loop)', fontweight='bold')
+
+    # 2. Pitch Command vs Actual Pitch (Inner Loop Tracking)
+    axs[1].plot(time, pitch_cmd, color='gray', linestyle='--', linewidth=2, label='Commanded')
+    axs[1].plot(time, pitch_actual, color='black', linewidth=2, label='Actual')
+    axs[1].set_ylabel('Pitch (deg)', fontweight='bold')
+    axs[1].set_title('Kinematic Pitch Tracking', fontweight='bold')
+    axs[1].legend(loc='upper right', frameon=False)
+
+    # 3. Pitch Rate (Aerodynamic Damping)
+    axs[2].plot(time, pitch_rate, color='black', linewidth=1.5)
+    axs[2].axhline(0, color='gray', linestyle='-', linewidth=1)
+    axs[2].set_ylabel('Pitch Rate (deg/s)', fontweight='bold')
+    axs[2].set_title('Rotational Velocity & Damping', fontweight='bold')
+
+    # 4. Required Aerodynamic Correction (Equivalent Fin Deflection)
+    #    Previously labelled as literal fin deflection; now documented as the
+    #    equivalent aerodynamic correction demand produced by the PD controller.
+    #    This is the value that is subsequently mapped to a canard clock angle.
+    axs[3].plot(time, surface_cmd, color='black', linewidth=1.5)
+    axs[3].fill_between(time, surface_cmd, 0, color='gray', alpha=0.2)
+    axs[3].axhline(0, color='gray', linestyle='-', linewidth=1)
+    axs[3].set_ylabel('Correction (deg)', fontweight='bold')
+    axs[3].set_xlabel('Time (s)', fontweight='bold')
+    axs[3].set_title(
+        'Required Aerodynamic Correction (Equivalent Fin Deflection)',
+        fontweight='bold'
+    )
+
+    return fig
+
+
+def create_canard_phase_telemetry_dashboard(guided_data):
+    """
+    Fixed-Canard Phase Guidance Telemetry figure.
+
+    Adds a second telemetry figure showing how the required aerodynamic
+    correction is translated into a fixed-canard clock orientation.
+
+    SIMULATION ASSUMPTION (documented):
+        Because the projectile rotational/phase dynamics occur on a
+        significantly faster timescale than the guidance and simulation
+        update intervals, canard phase alignment is treated as
+        instantaneous in this intermediate model.  Required and current
+        clock angles therefore overlap exactly.
+
+    Subplots
+    --------
+    1. Required Aerodynamic Correction vs Time
+    2. Required / Current Canard Clock Orientation vs Time
+    3. Normalised Correction Demand vs Time
+    4. Command-to-Orientation Mapping Consistency
+    """
+    time = guided_data['time']
+
+    # Pull fixed-canard telemetry; fall back gracefully if keys are absent
+    # (e.g. when called on a ballistic-only run that predates this feature).
+    required_correction_deg = guided_data.get('required_correction_deg', [0.0] * len(time))
+    required_fraction = guided_data.get('required_correction_fraction', [0.0] * len(time))
+    required_clock_deg = guided_data.get('required_canard_clock_angle_deg', [90.0] * len(time))
+    current_clock_deg = guided_data.get('current_canard_clock_angle_deg', [90.0] * len(time))
+
+    # cos(required_clock_rad) — should reproduce required_fraction exactly
+    mapping_check = [
+        math.cos(math.radians(a)) for a in required_clock_deg
+    ]
+
+    fig, axs = plt.subplots(4, 1, figsize=(12, 14), sharex=True)
+    fig.subplots_adjust(hspace=0.35)
+    fig.suptitle(
+        'Fixed-Canard Phase Guidance Telemetry',
+        fontsize=16, fontweight='bold'
+    )
+
+    # Shared styling
+    for ax in axs:
+        ax.grid(True, linestyle='--', alpha=0.4, color='gray')
+        ax.set_facecolor('#ffffff')
+        for spine in ax.spines.values():
+            spine.set_edgecolor('black')
+            spine.set_linewidth(1.5)
+        ax.tick_params(colors='black', width=1.5)
+
+    # ------------------------------------------------------------------
+    # 1. Required Aerodynamic Correction vs Time
+    # ------------------------------------------------------------------
+    axs[0].plot(time, required_correction_deg, color='black', linewidth=2)
+    axs[0].fill_between(time, required_correction_deg, 0, color='gray', alpha=0.2)
+    axs[0].axhline(0, color='gray', linestyle='-', linewidth=1)
+    axs[0].set_ylabel('Correction (deg)', fontweight='bold')
+    axs[0].set_title('Required Aerodynamic Correction', fontweight='bold')
+
+    # ------------------------------------------------------------------
+    # 2. Fixed Canard Clock Angle vs Time
+    #    0°  = maximum positive correction
+    #    90° = neutral (zero pitch-plane correction)
+    #    180°= maximum negative correction
+    # ------------------------------------------------------------------
+    axs[1].plot(
+        time, required_clock_deg,
+        color='black', linewidth=2, label='Required clock angle'
+    )
+    axs[1].plot(
+        time, current_clock_deg,
+        color='red', linewidth=1.5, linestyle='--', alpha=0.7,
+        label='Current clock angle (instantaneous)'
+    )
+    axs[1].axhline(
+        90.0, color='green', linestyle=':', linewidth=1.5, alpha=0.8,
+        label='90° — neutral orientation'
+    )
+    axs[1].set_ylim(-5, 185)
+    axs[1].set_yticks([0, 45, 90, 135, 180])
+    axs[1].set_ylabel('Clock angle (deg)', fontweight='bold')
+    axs[1].set_title(
+        'Required / Current Canard Clock Orientation\n'
+        '(0° = max +ve  |  90° = neutral  |  180° = max −ve)',
+        fontweight='bold'
+    )
+    axs[1].legend(loc='upper right', frameon=False, fontsize=9)
+
+    # ------------------------------------------------------------------
+    # 3. Normalised Correction Demand vs Time
+    # ------------------------------------------------------------------
+    axs[2].plot(time, required_fraction, color='black', linewidth=2)
+    axs[2].fill_between(time, required_fraction, 0, color='gray', alpha=0.2)
+    axs[2].axhline(0, color='gray', linestyle='-', linewidth=1)
+    axs[2].axhline(1.0, color='green', linestyle=':', linewidth=1, alpha=0.7)
+    axs[2].axhline(-1.0, color='green', linestyle=':', linewidth=1, alpha=0.7)
+    axs[2].set_ylim(-1.25, 1.25)
+    axs[2].set_ylabel('Fraction (−1 to +1)', fontweight='bold')
+    axs[2].set_title('Normalised Correction Demand', fontweight='bold')
+
+    # ------------------------------------------------------------------
+    # 4. Command-to-Orientation Mapping Consistency
+    #    Plots required_correction_fraction and cos(required_clock_angle).
+    #    These are mathematically identical by construction (not independent
+    #    validation); the overlap confirms the mapping is applied correctly.
+    # ------------------------------------------------------------------
+    axs[3].plot(
+        time, required_fraction,
+        color='black', linewidth=2.5, label='Required correction fraction'
+    )
+    axs[3].plot(
+        time, mapping_check,
+        color='red', linewidth=1.5, linestyle='--', alpha=0.8,
+        label='cos(required clock angle)'
+    )
+    axs[3].axhline(0, color='gray', linestyle='-', linewidth=1)
+    axs[3].set_ylim(-1.25, 1.25)
+    axs[3].set_ylabel('Value', fontweight='bold')
+    axs[3].set_xlabel('Time (s)', fontweight='bold')
+    axs[3].set_title('Command-to-Orientation Mapping Consistency', fontweight='bold')
+    axs[3].legend(loc='upper right', frameon=False, fontsize=9)
+
+    # Annotation box explaining the assumption
+    note = (
+        "Assumption: canard phase alignment is instantaneous\n"
+        "relative to the guidance update period.\n"
+        "Required ≡ Current clock angle in this model."
+    )
+    fig.text(
+        0.98, 0.01, note,
+        ha='right', va='bottom', fontsize=8,
+        color='dimgray', style='italic',
+        bbox=dict(boxstyle='round,pad=0.3', facecolor='lightyellow',
+                  edgecolor='gray', alpha=0.7)
+    )
+
+    plt.tight_layout(rect=[0, 0.04, 1, 1])
+    return fig

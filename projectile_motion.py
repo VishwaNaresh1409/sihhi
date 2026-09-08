@@ -1,119 +1,130 @@
 """
 Ballistic projectile motion calculator.
 
-Solves for launch angle and velocity needed to hit a target,
-assuming NO aerodynamic effects (simple projectile motion).
+Solves for launch angle using closed-form quadratic solution.
+Falls back to fine-grained numerical search only if closed form fails.
 
-This is intentionally simplified - it WILL miss in reality
-because it ignores drag.
+FIXES:
+- Closed-form solution instead of 1-degree integer search
+- Added validity check: warns if target is beyond max ballistic range
+- Picks flatter (lower-energy) of the two solution angles
 """
 
 import math
+import numpy as np
 import config
-
 
 def calculate_ballistic_solution(target_x, target_y, launch_x=0.0, launch_y=0.0,
                                  initial_velocity_magnitude=None):
     """
     Calculate launch angle to hit a target using ballistic equations.
-
-    Solves: y = x*tan(θ) - (g*x²)/(2*v²*cos²(θ))
-
     Ignores aerodynamic drag completely.
-
-    Args:
-        target_x: target horizontal position (m)
-        target_y: target altitude (m)
-        launch_x: launch horizontal position (m)
-        launch_y: launch altitude (m)
-        initial_velocity_magnitude: launch speed (m/s), if None uses config reference
-
-    Returns:
-        dict with keys:
-        - 'launch_angle_rad': launch angle in radians (positive = nose up)
-        - 'launch_angle_deg': launch angle in degrees
-        - 'launch_velocity': launch speed in m/s
-        - 'time_to_target': predicted flight time in seconds
-        - 'success': whether a solution was found
-        - 'reason': explanation if no solution
     """
-
     if initial_velocity_magnitude is None:
         initial_velocity_magnitude = config.reference_velocity_x
 
-    # Relative target position
     dx = target_x - launch_x
     dy = target_y - launch_y
-
     g = config.gravity
     v = initial_velocity_magnitude
 
-    # Special case: target directly overhead/below
+    # Validity check: Is target beyond maximum possible ballistic range?
+    max_range = (v ** 2) / g
+    if dx > max_range:
+        return {
+            'success': False,
+            'reason': f'Target ({dx}m) is beyond max ballistic range ({max_range:.1f}m) for v={v}m/s',
+            'launch_angle_rad': 0.0,
+            'launch_angle_deg': 0.0,
+            'launch_velocity': v,
+            'time_to_target': 0.0,
+            'predicted_range': max_range,
+        }
+
     if dx < 0.1:
         return {
             'success': False,
-            'reason': 'Target behind launch point',
+            'reason': 'Target behind or at launch point',
             'launch_angle_rad': 0.0,
             'launch_angle_deg': 0.0,
             'launch_velocity': v,
-            'time_to_target': 0.0
+            'time_to_target': 0.0,
+            'predicted_range': dx,
         }
 
-    # Ballistic equation: y = x*tan(θ) - (g*x²)/(2*v²*cos²(θ))
-    # Rearrange to standard form and solve using quadratic formula
+        # Check if target is physically reachable in a vacuum
+        max_ballistic_range = (v ** 2) / g
+        if dx > max_ballistic_range:
+            return {
+                "success": False,
+                "reason": (
+                    f"Target ({dx:.1f}m) exceeds max ballistic range"
+                    f" ({max_ballistic_range:.1f}m) at {v}m/s"
+                ),
+                "launch_angle_rad": 0.0,
+                "launch_angle_deg": 0.0,
+                "launch_velocity": v,
+                "time_to_target": 0.0,
+                "predicted_range": max_ballistic_range,
+            }
 
-    # Let tan(θ) = t, then: y = x*t - (g*x²)/(2*v²*(1+t²))
-    # Multiply by (1+t²): y*(1+t²) = x*t*(1+t²) - (g*x²)/(2*v²)
-    # Expand: y + y*t² = x*t + x*t³ - (g*x²)/(2*v²)
-    # Rearrange: x*t³ + t²*(y-x²*g/(2*v²)) + t*x - y = 0
+    # Closed-form ballistic solution
+    # y = x*tan(θ) - g*x²/(2v²cos²θ)
+    # Using 1/cos²θ = 1 + tan²(θ), we get a quadratic in terms of tan(θ):
+    A = (g * dx ** 2) / (2.0 * v ** 2)
+    B = dx
+    C = dy + (g * dx ** 2) / (2.0 * v ** 2)
 
-    # For simplicity, use numerical method (trial and error for launch angle)
+    discriminant = B ** 2 - 4.0 * A * C
+
     best_angle = None
-    best_error = float('inf')
+    best_time = 0.0
 
-    # Try angles from -45° to +90°
-    for angle_deg in range(-45, 91):
-        angle_rad = math.radians(angle_deg)
+    if discriminant >= 0:
+        sqrt_disc = math.sqrt(discriminant)
+        t1 = (B + sqrt_disc) / (2.0 * A)
+        t2 = (B - sqrt_disc) / (2.0 * A)
 
-        # Calculate where projectile lands
-        cos_a = math.cos(angle_rad)
-        sin_a = math.sin(angle_rad)
+        angle1 = math.atan(t1)
+        angle2 = math.atan(t2)
 
-        if cos_a == 0:
-            continue
+        candidates = []
+        for angle in [angle1, angle2]:
+            cos_a = math.cos(angle)
+            if cos_a > 0.01:
+                t_flight = dx / (v * cos_a)
+                if t_flight > 0:
+                    candidates.append((angle, t_flight))
 
-        # Ballistic trajectory formula
-        # y = x*tan(θ) - (g*x²)/(2*v²*cos²(θ))
-        predicted_y = dx * math.tan(angle_rad) - (g * dx ** 2) / (2 * v ** 2 * cos_a ** 2)
+        if candidates:
+            # Choose the flatter trajectory (smaller absolute angle) to minimize drag error
+            candidates.sort(key=lambda x: abs(x[0]))
+            best_angle, best_time = candidates[0]
 
-        # Error from target
-        error = abs(predicted_y - dy)
-
-        if error < best_error:
-            best_error = error
-            best_angle = angle_rad
-
+    # Fallback: fine-grained numerical search if closed-form fails mathematically
     if best_angle is None:
+        best_error = float('inf')
+        for angle_deg_100 in range(-4500, 9001):
+            angle_rad = math.radians(angle_deg_100 / 100.0)
+            cos_a = math.cos(angle_rad)
+            if cos_a < 0.01:
+                continue
+            predicted_y = dx * math.tan(angle_rad) - (g * dx ** 2) / (2 * v ** 2 * cos_a ** 2)
+            error = abs(predicted_y - dy)
+            if error < best_error:
+                best_error = error
+                best_angle = angle_rad
+                best_time = dx / (v * cos_a)
+
+    if best_angle is None or best_time <= 0:
         return {
             'success': False,
-            'reason': 'No ballistic solution found',
+            'reason': 'No valid trajectory found',
             'launch_angle_rad': 0.0,
             'launch_angle_deg': 0.0,
             'launch_velocity': v,
-            'time_to_target': 0.0
-        }
-
-    # Calculate time to target using: x = v*cos(θ)*t
-    time_to_target = dx / (v * math.cos(best_angle))
-
-    if time_to_target <= 0:
-        return {
-            'success': False,
-            'reason': 'Negative time to target',
-            'launch_angle_rad': best_angle,
-            'launch_angle_deg': math.degrees(best_angle),
-            'launch_velocity': v,
-            'time_to_target': time_to_target
+            'time_to_target': 0.0,
+            'predicted_range': dx,
         }
 
     return {
@@ -122,26 +133,16 @@ def calculate_ballistic_solution(target_x, target_y, launch_x=0.0, launch_y=0.0,
         'launch_angle_rad': best_angle,
         'launch_angle_deg': math.degrees(best_angle),
         'launch_velocity': v,
-        'time_to_target': time_to_target,
+        'time_to_target': best_time,
         'predicted_range': dx,
-        'predicted_final_alt': launch_y + best_angle,
+        'predicted_final_alt': launch_y + dy,
     }
 
 
 def calculate_ballistic_trajectory(launch_x, launch_y, launch_velocity,
                                    launch_angle_rad, num_points=100):
     """
-    Calculate ballistic trajectory (no drag) for visualization.
-
-    Args:
-        launch_x: launch X position (m)
-        launch_y: launch Y position (m)
-        launch_velocity: launch speed (m/s)
-        launch_angle_rad: launch angle (radians)
-        num_points: number of trajectory points
-
-    Returns:
-        tuple of (x_list, y_list) trajectory points
+    Calculate full ballistic trajectory points for plotting.
     """
     g = config.gravity
     v = launch_velocity
@@ -150,31 +151,22 @@ def calculate_ballistic_trajectory(launch_x, launch_y, launch_velocity,
     cos_theta = math.cos(theta)
     sin_theta = math.sin(theta)
 
-    # Time to apex (peak altitude)
-    t_apex = (v * sin_theta) / g
+    if abs(sin_theta) < 1e-6:
+        t_total = 2.0
+    else:
+        t_apex = (v * sin_theta) / g
+        t_total = 2.0 * t_apex
 
-    # Total flight time (when y returns to launch altitude)
-    # Using: y = y0 + v*sin(θ)*t - 0.5*g*t²
-    # At ground: 0 = 0 + v*sin(θ)*t - 0.5*g*t²
-    # t = 2*v*sin(θ)/g
-    t_total = 2 * t_apex
-
-    # Extend time slightly beyond landing
-    t_max = t_total * 1.2
+    t_max = max(t_total * 1.2, 5.0)
 
     times = np.linspace(0, t_max, num_points)
-
     x_list = []
     y_list = []
 
     for t in times:
         x = launch_x + v * cos_theta * t
         y = launch_y + v * sin_theta * t - 0.5 * g * t ** 2
-
         x_list.append(x)
         y_list.append(y)
 
     return x_list, y_list
-
-
-import numpy as np

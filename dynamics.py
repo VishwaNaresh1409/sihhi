@@ -2,93 +2,89 @@
 Dynamics integration and time-stepping for the vehicle simulation.
 
 Implements the main numerical integration loop that advances vehicle state
-based on forces and accelerations.
+based on forces and accelerations, with aerodynamic pitch damping.
 """
 
 import math
-import numpy as np
 import config
 from vehicle import Vehicle
-from forces import calculate_total_force, calculate_gravity_force
-
+from forces import calculate_total_force
 
 class VehicleDynamics:
     """
     Manages vehicle dynamics integration and state updates.
-
-    Separates the physics calculation from state management.
     """
 
     def __init__(self, vehicle):
-        """
-        Initialize dynamics simulator.
-
-        Args:
-            vehicle: Vehicle object to simulate
-        """
         self.vehicle = vehicle
         self.current_time = 0.0
+        self.wind_x = 0.0
+        self.wind_y = 0.0
+
+    def set_wind(self, wind_x, wind_y):
+        self.wind_x = wind_x
+        self.wind_y = wind_y
 
     def calculate_accelerations(self, total_force_x, total_force_y):
-        """
-        Calculate linear accelerations from forces using F=ma.
-
-        Args:
-            total_force_x: total force in X direction (Newtons)
-            total_force_y: total force in Y direction (Newtons)
-
-        Returns:
-            accel_x, accel_y: accelerations in m/s^2
-        """
         mass = self.vehicle.mass
-
         accel_x = total_force_x / mass
         accel_y = total_force_y / mass
-
         return accel_x, accel_y
 
+    def calculate_pitch_torque(self, surface_angles):
+        """
+        Calculate net torque about the pitch axis from control surface deflections
+        and apply aerodynamic rotational damping.
+        """
+        airspeed_x = self.vehicle.velocity_x - self.wind_x
+        airspeed_y = self.vehicle.velocity_y - self.wind_y
+        airspeed_mag = math.sqrt(airspeed_x ** 2 + airspeed_y ** 2)
+
+        if airspeed_mag < 0.1:
+            return 0.0
+
+        dynamic_pressure = 0.5 * config.air_density * airspeed_mag ** 2
+        moment_arm = config.vehicle_reference_length * 0.4
+
+        total_torque = 0.0
+        for angle_rad in surface_angles:
+            angle_deg = math.degrees(angle_rad)
+            cl = config.control_surface_lift_coefficient_per_angle * angle_deg
+            lift = dynamic_pressure * cl * config.control_surface_area
+            total_torque += lift * moment_arm
+
+        # Add physical aerodynamic pitch damping opposing rotational rate
+        pitch_damping_torque = 4.0 * self.vehicle.pitch_rate
+        total_torque -= pitch_damping_torque
+
+        # Ensure a float is always returned to prevent NoneType math errors
+        return float(total_torque)
+
     def step(self, dt, surface_angles):
-        """
-        Advance vehicle state by one timestep.
-
-        This is the main physics integration function.
-
-        Process:
-        1. Calculate forces based on current state
-        2. Calculate accelerations from forces
-        3. Update velocities and positions
-        4. Update orientation (pitch angle)
-
-        Args:
-            dt: timestep in seconds
-            surface_angles: list of current control surface angles in radians
-        """
-        # Get current altitude for atmospheric calculations
         altitude = self.vehicle.get_altitude()
 
-        # Calculate total force on vehicle
         total_fx, total_fy = calculate_total_force(
             self.vehicle,
             surface_angles,
-            altitude
+            altitude,
+            wind_x=self.wind_x,
+            wind_y=self.wind_y
         )
 
-        # Calculate linear accelerations
         accel_x, accel_y = self.calculate_accelerations(total_fx, total_fy)
+        pitch_torque = self.calculate_pitch_torque(surface_angles)
 
-        # For pitch angle, we need rotational dynamics
-        # Simplified: no rotational dynamics in this version
-        # Pitch angle follows from control surface positions or pilot input
-        # If you want to add rotational inertia, implement a torque calculation
-        angular_accel = 0.0  # rad/s^2 (could be calculated from surface moments)
+        # Fallback safety catch
+        if pitch_torque is None:
+            pitch_torque = 0.0
 
-        # Update vehicle kinematics
+        angular_accel = pitch_torque / self.vehicle.pitch_inertia
+
         self.vehicle.update_kinematics(accel_x, accel_y, angular_accel, dt)
-
-        # Update time
         self.current_time += dt
 
     def reset(self):
-        """Reset dynamics to initial state."""
         self.vehicle.reset()
         self.current_time = 0.0
+        self.wind_x = 0.0
+        self.wind_y = 0.0
